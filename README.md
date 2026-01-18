@@ -554,15 +554,52 @@ gcloud run deploy nurse-web `
 
 ## 17. IAP（特定メール/グループのみ）でアクセス制限
 
-Cloud Run の直URLを使わず、入口を LB + IAP に統一します。
+Cloud Run の直接URLを外部に公開せず、入口を HTTP(S) ロードバランサ（LB）と IAP に統一して強固な認証を実装します。
 
-GCP Console で行うこと（チェックリスト）:
-1. HTTP(S) Load Balancer を作成
-2. Serverless NEG で nurse-web / nurse-api を紐づけ
-3. パスルーティング（例：`/api/*` → api、それ以外 → web）
-4. IAP を有効化
-5. 許可するメール / Googleグループを登録
-6. api 側は本番で IAP ヘッダの email を使って user を識別（X-Debug-Email は本番では無効）
+### GCP Console での構築チェックリスト
+
+#### 1. Serverless NEG（ネットワーク エンドポイント グループ）の作成
+ロードバランサと Cloud Run を繋ぐためのグループを作成します。
+- **[コンピューティング] > [Network Endpoint Groups]** を開きます。
+- **nurse-web 用**: [名前: `neg-nurse-web` / リージョン: `asia-northeast1` / タイプ: `サーバーレス NEG` / サービス: `nurse-web`] で作成。
+- **nurse-api 用**: [名前: `neg-nurse-api` / リージョン: `asia-northeast1` / タイプ: `サーバーレス NEG` / サービス: `nurse-api`] で作成。
+
+#### 2. HTTP(S) ロードバランサ（LB）の作成
+単一のグローバルIPでリクエストを受け取ります。
+- **[ネットワーク サービス] > [ロードバランシング]** から [ロードバランサを作成] を選択。
+- **Frontend の設定**: [プロトコル: `HTTPS` / IPアドレス: `静的IPを予約`] 独自ドメインを使用する場合は Google 管理の証明書を発行します。
+- **Backend の設定**:
+    - **Backend 1**: [名前: `be-nurse-web` / タイプ: `サーバーレス NEG` / NEG: `neg-nurse-web`] を選択。
+    - **Backend 2**: [名前: `be-nurse-api` / タイプ: `サーバーレス NEG` / NEG: `neg-nurse-api`] を選択。
+- **ルーティング規則（重要）**:
+    - デフォルト（それ以外）: `be-nurse-web`
+    - パス規則を追加: `/api/*` → `be-nurse-api`（ホスト名は同一でパスのみ変更）
+
+#### 3. IAP の有効化とプリンシパルの登録
+特定のユーザーのみを通過させます。
+- **[セキュリティ] > [Identity-Aware Proxy]** を開きます。
+- **HTTPS バックエンド サービス** の一覧から `be-nurse-web` と `be-nurse-api` のスイッチを **[ON]** にします。
+- **アクセス許可**: 対象のサービスを選択し、右パネルで [プリンシパルを追加] をクリック。
+    - **メンバー**: 許可するメールアドレスまたは Google グループ。
+    - **ロール**: `IAP-secured Web App User` を付与。
+
+#### 4. Cloud Run の Ingress 制限
+LB 以外からのアクセスを遮断します。
+- 各 Cloud Run サービスの **[ネットワーキング]** タブを開きます。
+- **[入力（Ingress）]** 設定を **「内部および Cloud Load Balancing からのトラフィックを許可する」** に変更します。これで `.run.app` 直URLでのアクセスができなくなります。
+
+#### 5. API 側のユーザー識別設定（本番反映）
+アプリ側（`nurse-api`）で IAP の認証情報を正しく読み取るための設定です。
+- **環境変数の設定**:
+    - [cite_start]`DEBUG`: `false` (本番モード。`X-Debug-Email` ヘッダーを無効化し IAP 経由のみを信頼する) [cite: 1]
+    - [cite_start]`ALLOWLIST_EMAILS`: 許可するメールアドレスをカンマ区切りで入力 [cite: 1]
+- [cite_start]**識別ロジック**: `main.py` の `get_current_user` が、IAP が付与する `x-goog-authenticated-user-email` ヘッダーを解析し、DB 内のユーザー ID と紐付けます [cite: 1]
+
+
+
+### 開発・検証用メモ
+- **LB の反映**: 設定後、世界中のエッジに設定が反映されるまで 5〜10 分程度かかる場合があります。
+- [cite_start]**ヘッダーの確認**: ローカル開発時は `DEBUG=true` にし、`X-Debug-Email` を送信することで IAP 環境を擬似的にテストできます [cite: 1]
 
 ---
 
