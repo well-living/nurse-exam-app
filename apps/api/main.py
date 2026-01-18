@@ -1,12 +1,16 @@
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, AsyncGenerator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from sse_starlette.sse import EventSourceResponse
+
+from db import db, create_tables
 
 
 class Settings(BaseSettings):
@@ -14,6 +18,7 @@ class Settings(BaseSettings):
     allowlist_emails: str = ""  # comma-separated emails
     anthropic_api_key: str = ""
     allowed_origins: str = "http://localhost:3000"
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/nurse_exam"
 
     model_config = {"env_prefix": "", "env_file": ".env"}
 
@@ -29,7 +34,14 @@ settings = Settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Connect to database on startup
+    if settings.database_url:
+        await db.connect(settings.database_url)
+        async with db.acquire() as conn:
+            await create_tables(conn)
     yield
+    # Disconnect from database on shutdown
+    await db.disconnect()
 
 
 app = FastAPI(title="Nurse Exam API", lifespan=lifespan)
@@ -43,22 +55,72 @@ app.add_middleware(
 )
 
 
+# =============================================================================
+# Models
+# =============================================================================
+
+
 class User(BaseModel):
+    id: uuid.UUID | None = None
     email: str
 
 
-def get_current_user(
+class AttemptCreate(BaseModel):
+    question_id: uuid.UUID
+    selected_answer: int
+
+
+class AttemptResponse(BaseModel):
+    id: uuid.UUID
+    question_id: uuid.UUID
+    selected_answer: int
+    is_correct: bool
+    correct_answer: int | None = None
+    explanation: str | None = None
+    created_at: datetime
+
+
+class AttemptListResponse(BaseModel):
+    id: uuid.UUID
+    question_id: uuid.UUID
+    selected_answer: int
+    is_correct: bool
+    created_at: datetime
+    question_text: str | None = None
+    category: str | None = None
+
+
+class CategoryStat(BaseModel):
+    category: str
+    total: int
+    correct: int
+    accuracy_rate: float
+
+
+class StatsResponse(BaseModel):
+    total_attempts: int
+    correct_count: int
+    accuracy_rate: float
+    by_category: list[CategoryStat]
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict[str, str]] | None = None
+
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+
+async def get_current_user(
     x_goog_authenticated_user_email: Annotated[str | None, Header()] = None,
     x_debug_email: Annotated[str | None, Header()] = None,
 ) -> User:
     """
     Extract user email from IAP header or debug header.
-
-    In production (GCP IAP):
-      - Uses X-Goog-Authenticated-User-Email header (format: "accounts.google.com:email@example.com")
-
-    In local development (debug=True):
-      - Allows X-Debug-Email header
+    Creates user in database if not exists.
     """
     email: str | None = None
 
@@ -79,7 +141,26 @@ def get_current_user(
         if email not in settings.allowed_emails_set:
             raise HTTPException(status_code=403, detail="Access denied")
 
-    return User(email=email)
+    # Get or create user in database
+    user_id = None
+    if db.pool:
+        async with db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM users WHERE email = $1", email
+            )
+            if row:
+                user_id = row["id"]
+            else:
+                user_id = await conn.fetchval(
+                    "INSERT INTO users (email) VALUES ($1) RETURNING id", email
+                )
+
+    return User(id=user_id, email=email)
+
+
+# =============================================================================
+# Health Check
+# =============================================================================
 
 
 @app.get("/health")
@@ -87,9 +168,170 @@ async def health():
     return {"status": "ok"}
 
 
-class ChatRequest(BaseModel):
-    message: str
-    history: list[dict[str, str]] | None = None
+# =============================================================================
+# Attempts API
+# =============================================================================
+
+
+@app.post("/attempts", response_model=AttemptResponse)
+async def create_attempt(
+    attempt: AttemptCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    """Submit an answer and get the result."""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db.acquire() as conn:
+        # Get question to check answer
+        question = await conn.fetchrow(
+            "SELECT correct_answer, explanation FROM questions WHERE id = $1",
+            attempt.question_id,
+        )
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        is_correct = attempt.selected_answer == question["correct_answer"]
+
+        # Insert attempt
+        row = await conn.fetchrow(
+            """
+            INSERT INTO attempts (user_id, question_id, selected_answer, is_correct)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, created_at
+            """,
+            current_user.id,
+            attempt.question_id,
+            attempt.selected_answer,
+            is_correct,
+        )
+
+        return AttemptResponse(
+            id=row["id"],
+            question_id=attempt.question_id,
+            selected_answer=attempt.selected_answer,
+            is_correct=is_correct,
+            correct_answer=question["correct_answer"],
+            explanation=question["explanation"],
+            created_at=row["created_at"],
+        )
+
+
+@app.get("/attempts", response_model=list[AttemptListResponse])
+async def list_attempts(
+    current_user: Annotated[User, Depends(get_current_user)],
+    limit: int = Query(default=50, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    """Get user's attempt history."""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                a.id,
+                a.question_id,
+                a.selected_answer,
+                a.is_correct,
+                a.created_at,
+                q.question_text,
+                q.category
+            FROM attempts a
+            JOIN questions q ON a.question_id = q.id
+            WHERE a.user_id = $1
+            ORDER BY a.created_at DESC
+            LIMIT $2 OFFSET $3
+            """,
+            current_user.id,
+            limit,
+            offset,
+        )
+
+        return [
+            AttemptListResponse(
+                id=row["id"],
+                question_id=row["question_id"],
+                selected_answer=row["selected_answer"],
+                is_correct=row["is_correct"],
+                created_at=row["created_at"],
+                question_text=row["question_text"],
+                category=row["category"],
+            )
+            for row in rows
+        ]
+
+
+# =============================================================================
+# Stats API
+# =============================================================================
+
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats(
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    """Get user's learning statistics."""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with db.acquire() as conn:
+        # Overall stats
+        overall = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE is_correct) as correct
+            FROM attempts
+            WHERE user_id = $1
+            """,
+            current_user.id,
+        )
+
+        total = overall["total"] or 0
+        correct = overall["correct"] or 0
+        accuracy_rate = (correct / total * 100) if total > 0 else 0.0
+
+        # Stats by category
+        category_rows = await conn.fetch(
+            """
+            SELECT
+                q.category,
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE a.is_correct) as correct
+            FROM attempts a
+            JOIN questions q ON a.question_id = q.id
+            WHERE a.user_id = $1
+            GROUP BY q.category
+            ORDER BY q.category
+            """,
+            current_user.id,
+        )
+
+        by_category = [
+            CategoryStat(
+                category=row["category"],
+                total=row["total"],
+                correct=row["correct"],
+                accuracy_rate=(row["correct"] / row["total"] * 100)
+                if row["total"] > 0
+                else 0.0,
+            )
+            for row in category_rows
+        ]
+
+        return StatsResponse(
+            total_attempts=total,
+            correct_count=correct,
+            accuracy_rate=accuracy_rate,
+            by_category=by_category,
+        )
+
+
+# =============================================================================
+# Chat API
+# =============================================================================
 
 
 async def generate_chat_response(
