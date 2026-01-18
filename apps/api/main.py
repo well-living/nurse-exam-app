@@ -32,16 +32,30 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+import logging # 追加
+
+logger = logging.getLogger("uvicorn") # 追加
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Connect to database on startup
     if settings.database_url:
-        await db.connect(settings.database_url)
-        async with db.acquire() as conn:
-            await create_tables(conn)
+        try:
+            await db.connect(settings.database_url)
+            logger.info("Database connected.")
+            
+            # テーブル作成もエラー時はスキップする
+            async with db.acquire() as conn:
+                await create_tables(conn)
+        except Exception as e:
+            # ここが重要：エラーをキャッチしてログに出すが、アプリは落とさない
+            logger.error(f"WARNING: Database connection failed. The app will start without DB. Error: {e}")
+    
     yield
+    
     # Disconnect from database on shutdown
-    await db.disconnect()
+    if db.is_connected: # 接続されている場合のみ切断
+        await db.disconnect()
 
 
 app = FastAPI(title="Nurse Exam API", lifespan=lifespan)

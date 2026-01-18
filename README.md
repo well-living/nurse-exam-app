@@ -500,6 +500,56 @@ gcloud builds submit apps/api --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO
 gcloud run deploy nurse-api --image "$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/nurse-api:$SHA" --region $REGION --allow-unauthenticated
 ```
 
+#### デプロイ・更新手順
+
+以下の手順は、ソースコードを変更した際の本番環境への反映方法です。
+
+##### 1. API (バックエンド: Python/FastAPI) の更新
+API側の修正（`main.py` やロジックの変更）を反映します。
+
+```powershell
+# 変数の設定（PowerShell）
+$REGION = "asia-northeast1"
+$REPO = "nurse-exam-app"
+$PROJECT_ID = "fpy-project"
+$SHA = (git rev-parse --short HEAD)
+
+# イメージのビルド
+gcloud builds submit apps/api --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/api:$SHA"
+
+# Cloud Run へのデプロイ
+# ALLOWLIST_EMAILS などの環境変数は必要に応じて --set-env-vars で追加・更新してください
+gcloud run deploy nurse-api `
+  --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/api:$SHA" `
+  --region $REGION `
+  --allow-unauthenticated
+```
+
+##### 2. Web (フロントエンド: Next.js) の更新
+Web側の修正や、接続先APIのURLが変更になった場合に実行します。
+
+```powershell
+# 接続先となる API の URL を取得（未取得の場合）
+$API_URL = gcloud run services describe nurse-api --region asia-northeast1 --format='value(status.url)'
+
+# イメージのビルド
+gcloud builds submit apps/web --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/web:$SHA"
+
+# Cloud Run へのデプロイ
+# NEXT_PUBLIC_API_URL に API の URL を注入することでフロントエンドから通信可能になります
+gcloud run deploy nurse-web `
+  --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/web:$SHA" `
+  --region $REGION `
+  --allow-unauthenticated `
+  --set-env-vars "NEXT_PUBLIC_API_URL=$API_URL"
+```
+
+##### 注意事項
+- **データベース接続**: 現在、`main.py` の `lifespan` はDB接続エラーをスキップするよう修正されています。本番用DBへ接続する場合は、デプロイ時に `DATABASE_URL` を設定してください。
+- **反映されない場合**: ブラウザのキャッシュが原因の可能性があります。シークレットモードでの確認や、ビルドタグを `$SHA` ではなく現在時刻（`yyyyMMdd-HHmm`）に変更して試してください。
+
+
+
 ---
 
 ## 17. IAP（特定メール/グループのみ）でアクセス制限
@@ -523,11 +573,6 @@ GCP Console で行うこと（チェックリスト）:
 
 ---
 
-## 19. 次にやること（おすすめ）
 
-- questions の本データ（CSV/JSON）を作り、DBへ取り込みスクリプトを追加
-- Cloud SQL + Secret Manager を接続して本番DBへ
-- GitHub Actions（WIF）で Cloud Run を自動デプロイ
-- IAPヘッダの実値に合わせて api の email取得を確定
 
 ---
