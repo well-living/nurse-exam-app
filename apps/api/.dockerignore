@@ -1,0 +1,42 @@
+# Virtual environment
+.venv
+venv
+env
+ENV
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Testing
+tests
+htmlcov
+.coverage
+coverage.xml
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+README.md
+.git
+.gitignore
+Dockerfile
+.dockerignore
+.python-version
